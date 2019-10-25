@@ -1,5 +1,6 @@
 ---
-string robotMode
+# This should return raw dashboard response for interpretation by service client
+string robotMode    
 string safetyMode
 string loadedProgram
 string programState

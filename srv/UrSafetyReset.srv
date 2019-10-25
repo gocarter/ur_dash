@@ -1,0 +1,4 @@
+bool unlockProtectiveStop
+bool resetSafety
+---
+bool success

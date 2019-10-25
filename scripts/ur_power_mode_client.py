@@ -6,7 +6,7 @@ from threading import Lock
 from ur_dash.srv import *
 import rospy
 
-# PORT = 29999              #DEPRECATED BECAUSE OF POSSIBLE UNDEFINED BEHAVIOUR
+# PORT = 29999  #DEPRECATED BECAUSE OF POSSIBLE UNDEFINED BEHAVIOUR
 # ADRESS = '192.168.0.10'   #DEPRECATED BECAUSE OF POSSIBLE UNDEFINED BEHAVIOUR
 TIMEOUT = 2
 lock = Lock()
@@ -15,14 +15,19 @@ powerSrv = None
 programSrv = None
 installationSrv = None
 modeSrv = None
+safetySrv = None
 
 
 def open_connection():
     # rospy.loginfo('open_connection()')
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.connect((rospy.get_param('ur_robot_ip'),
-               rospy.get_param('ur_robot_port')),)
-    return s
+    try:
+        s.connect((rospy.get_param('ur_robot_ip'),
+                   rospy.get_param('ur_robot_port')),)
+    except Exception as e:
+        rospy.logerr("Unable to connect into UR arm.")
+    finally:
+        return s
 
 
 def getResponse(server, buffer_size=44, timeout=TIMEOUT):
@@ -45,7 +50,7 @@ def getResponse(server, buffer_size=44, timeout=TIMEOUT):
     try:
         server.settimeout(0.05)
         flush = server.recv(1024)
-        #rospy.loginfo('flush: ' + flush)
+        # rospy.loginfo('flush: ' + flush)
     except Exception:
         pass
     finally:
@@ -132,35 +137,39 @@ def service_handler_on_off(req):
         return resp
 
 
+def _mode(req, server):
+    text = getResponse(server, 44)
+
+    resp = UrRobotModeResponse()
+
+    if not 'Connected: Universal Robots Dashboard Server' in text:
+        resp.loadedProgram = None
+        resp.programState = None
+        resp.robotMode = None
+        resp.safetyMode = None
+    else:
+        server.send('robotmode\r\n')
+        resp.robotMode = getResponse(
+            server, 24, 0.2).replace('Robotmode: ', '')
+        rospy.sleep(0.01)
+        server.send('get loaded program\r\n')
+        resp.loadedProgram = getResponse(
+            server, 60, 0.2).replace('Loaded program: ', '')
+        rospy.sleep(0.01)
+        server.send('programState\r\n')
+        resp.programState = getResponse(server, 7, 0.2)
+        rospy.sleep(0.01)
+        server.send('safetymode\r\n')
+        resp.safetyMode = getResponse(
+            server, 33, 0.2).replace('Safetymode: ', '')
+    return resp
+
+
 def service_handler_mode(req):
     try:
         lock.acquire()
         server = open_connection()
-        text = getResponse(server, 44)
-
-        resp = UrRobotModeResponse()
-
-        if not 'Connected: Universal Robots Dashboard Server' in text:
-            resp.loadedProgram = None
-            resp.programState = None
-            resp.robotMode = None
-            resp.safetyMode = None
-        else:
-            server.send('robotmode\r\n')
-            resp.robotMode = getResponse(
-                server, 20, 0.2).replace('Robotmode: ', '')
-            rospy.sleep(0.01)
-            server.send('get loaded program\r\n')
-            resp.loadedProgram = getResponse(
-                server, 60, 0.2).replace('Loaded program: ', '')
-            rospy.sleep(0.01)
-            server.send('programState\r\n')
-            resp.programState = getResponse(server, 7, 0.2)
-            rospy.sleep(0.01)
-            server.send('safetymode\r\n')
-            resp.safetyMode = getResponse(
-                server, 33, 0.2).replace('Safetymode: ', '')
-
+        resp = _mode(req, server)
     except Exception as ex:
         rospy.logerr('154: except = ' + str(ex))
         pass
@@ -263,23 +272,63 @@ def service_handler_installation(req):
         return resp
 
 
+def service_handler_safety(req):
+    try:
+        lock.acquire()
+        server = open_connection()
+        text = getResponse(server, 44)
+        success = False
+        resp = UrSafetyReset()
+
+        if not 'Connected: Universal Robots Dashboard Server' in text:
+            resp.success = None
+        else:
+            if req.unlockProtectiveStop:
+                server.send('unlock protective stop\r\n')
+                rospy.loginfo('Unlocking protective stop on UR')
+                getResponse(server, 26, 2)
+            if req.resetSafety:
+                server.send('restart safety\r\n')
+                rospy.loginfo('Restarting safety on UR')
+                getResponse(server, 18, 2)
+            rospy.sleep(1.0)
+            modes = _mode(req, server)
+            resp.success = (
+                'NORMAL' in modes.safetyMode or 'REDUCED' in modes.safetyMode) or not req.restSafety
+            resp.success = resp.success and (
+                not 'PROTECTIVE_STOP' in modes.safetyMode or not req.unlockProtectiveStop)
+    except Exception as ex:
+        rospy.loginfo('199: except = ' + str(ex))
+        pass
+    finally:
+        # server.shutdown(socket.SHUT_RDWR) #could not be garbage collected
+        server.close()
+        lock.release()
+        rospy.loginfo(str(resp))
+        return resp
+
+
 def service_init():
     global powerSrv
     global programSrv
     global installationSrv
     global modeSrv
-    rospy.init_node('ur_dash_client')
+    global safetySrv
+
     powerSrv = rospy.Service(
         'ur_power_dash', UrPowerOnOff, service_handler_on_off)
     programSrv = rospy.Service(
         'ur_program_dash', UrRunProgram, service_handler_program)
     # installationSrv = rospy.Service('ur_installation_dash', UrLoadInstallation, service_handler_installation)
     modeSrv = rospy.Service('ur_state_dash', UrRobotMode, service_handler_mode)
+    safetySrv = rospy.Service(
+        'ur_safety_dash', UrSafetyReset, service_handler_safety)
 
 
 if __name__ == "__main__":
     try:
-        service_init()
+        rospy.init_node('ur_dash_client')
+
         # if not rospy.has_param('ur_robot_ip'):
         # rospy.set_param('ur_robot_ip',ADRESS) #DEPRECATED BECAUSE OF POSSIBLE UNDEFINED BEHAVIOUR
         while not rospy.has_param('ur_robot_ip'):
@@ -290,6 +339,7 @@ if __name__ == "__main__":
         while not rospy.has_param('ur_robot_port'):
             rospy.logerr_throttle(
                 5, "ur_robot_port parameter is not present on parameter server")
+        service_init()
         rospy.loginfo('Init has ended!')
         rospy.spin()
 
@@ -306,4 +356,5 @@ if __name__ == "__main__":
         programSrv.shutdown()
         # installationSrv.shutdown()
         modeSrv.shutdown()
+        safetySrv.shutdown()
         quit()
